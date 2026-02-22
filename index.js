@@ -1,175 +1,229 @@
-import express from "express";
-import TelegramBot from "node-telegram-bot-api";
-import { createClient } from "@supabase/supabase-js";
+// Simple Telegram Tap-to-Earn bot using Supabase
+// Required env vars on Railway:
+// BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY
 
-const app = express();
+const TelegramBot = require("node-telegram-bot-api");
+const { createClient } = require("@supabase/supabase-js");
 
-process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
-process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
 
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+if (!BOT_TOKEN) throw new Error("Missing env: BOT_TOKEN");
+if (!SUPABASE_URL) throw new Error("Missing env: SUPABASE_URL");
+if (!SUPABASE_KEY) throw new Error("Missing env: SUPABASE_KEY");
 
-// Supabase (ensure these 2 are in Railway Variables)
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-const MENU = (coins = 0) => ({
-  parse_mode: "HTML",
-  reply_markup: {
+function kbMain() {
+  return {
     inline_keyboard: [
       [{ text: "🔥 TAP", callback_data: "tap" }],
       [
-        { text: "📋 Daily Task", callback_data: "task" },
-        { text: "🎥 Watch Video", callback_data: "video" },
+        { text: "📺 Today Video", callback_data: "video" },
+        { text: "📊 Stats", callback_data: "stats" }
       ],
-      [
-        { text: "💰 Wallet", callback_data: "wallet" },
-        { text: "🧾 Withdraw", callback_data: "withdraw" },
-      ],
-      [{ text: "🏆 Leaderboard", callback_data: "leaderboard" }],
-    ],
-  },
-});
-
-function panel(name, coins) {
-  return (
-    `✨ <b>aiTapTap</b> 🚀\n` +
-    `━━━━━━━━━━━━━━\n` +
-    `👤 <b>User:</b> ${name}\n` +
-    `🪙 <b>Coins:</b> ${coins}\n` +
-    `━━━━━━━━━━━━━━\n` +
-    `👇 <i>Tap to earn coins</i>`
-  );
+      [{ text: "💳 Withdraw", callback_data: "withdraw" }]
+    ]
+  };
 }
 
-async function getOrCreateUser(userId, name) {
-  // Upsert user
-  await supabase.from("users").upsert({
-    user_id: userId,
-    name,
-    coins: 0,
-  });
+function safeName(user) {
+  const n = user?.first_name || user?.username || "Friend";
+  return String(n).slice(0, 40);
+}
 
-  // Read user
+async function ensureUser(tgUser) {
+  const tg_id = Number(tgUser.id);
+  const name = safeName(tgUser);
+
+  // upsert user by tg_id
+  // NOTE: requires users table with columns: tg_id (unique), name, coins, taps, streak, last_active_date
   const { data, error } = await supabase
     .from("users")
-    .select("coins,name")
-    .eq("user_id", userId)
+    .upsert(
+      {
+        tg_id,
+        name,
+        last_active_date: new Date().toISOString().slice(0, 10)
+      },
+      { onConflict: "tg_id" }
+    )
+    .select("tg_id,name,coins,taps,streak")
     .single();
 
   if (error) throw error;
   return data;
 }
 
+async function getLatestVideoUrl() {
+  // videos table: youtube_url, is_active, created_at
+  const { data, error } = await supabase
+    .from("videos")
+    .select("youtube_url,title,created_at")
+    .eq("is_active", true)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) throw error;
+  return data; // can be null if no rows
+}
+
+async function incrementTap(tg_id) {
+  // 1) fetch current
+  const { data: u, error: e1 } = await supabase
+    .from("users")
+    .select("coins,taps")
+    .eq("tg_id", tg_id)
+    .single();
+
+  if (e1) throw e1;
+
+  const newCoins = Number(u.coins || 0) + 1;
+  const newTaps = Number(u.taps || 0) + 1;
+
+  // 2) update
+  const { data: updated, error: e2 } = await supabase
+    .from("users")
+    .update({
+      coins: newCoins,
+      taps: newTaps,
+      last_active_date: new Date().toISOString().slice(0, 10)
+    })
+    .eq("tg_id", tg_id)
+    .select("coins,taps")
+    .single();
+
+  if (e2) throw e2;
+  return updated;
+}
+
+async function replyHome(chatId, userRow) {
+  const name = userRow?.name || "Friend";
+  const coins = Number(userRow?.coins || 0);
+
+  const text =
+    `🚀 <b>Welcome ${escapeHtml(name)}</b>\n` +
+    `🪙 <b>Coins:</b> ${coins}\n\n` +
+    `Tap to earn coins 👇`;
+
+  await bot.sendMessage(chatId, text, {
+    parse_mode: "HTML",
+    reply_markup: kbMain()
+  });
+}
+
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+// /start
 bot.onText(/\/start/, async (msg) => {
+  const chatId = msg.chat.id;
+
   try {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const name = msg.from.first_name || "User";
-
-    const user = await getOrCreateUser(userId, name);
-
-    await bot.sendMessage(chatId, panel(user.name || name, user.coins || 0), MENU(user.coins || 0));
-  } catch (e) {
-    console.error(e);
-    bot.sendMessage(msg.chat.id, "⚠️ Server issue. Please try /start again in 10 seconds.");
+    const u = await ensureUser(msg.from);
+    await replyHome(chatId, u);
+  } catch (err) {
+    console.error("START ERROR:", err?.message || err);
+    await bot.sendMessage(
+      chatId,
+      "⚠️ Server issue. Please try /start again in 10 seconds."
+    );
   }
 });
 
+// Buttons
 bot.on("callback_query", async (q) => {
   const chatId = q.message?.chat?.id;
-  const messageId = q.message?.message_id;
-  const userId = q.from.id;
-  const name = q.from.first_name || "User";
+  const tg_id = Number(q.from?.id);
+  const data = q.data;
 
   try {
-    // Always stop loading spinner quickly
-    try { await bot.answerCallbackQuery(q.id); } catch {}
+    if (!chatId) return;
 
-    if (!chatId || !messageId) return;
+    if (data === "tap") {
+      // quick ack so Telegram spinner stops
+      await bot.answerCallbackQuery(q.id, { text: "✅ +1 coin" });
 
-    if (q.data === "tap") {
-      // Read current coins
-      const { data: row, error } = await supabase
+      const updated = await incrementTap(tg_id);
+
+      const text =
+        `🪙 Coins: <b>${Number(updated.coins || 0)}</b>\n` +
+        `👆 Taps: ${Number(updated.taps || 0)}`;
+
+      await bot.sendMessage(chatId, text, {
+        parse_mode: "HTML",
+        reply_markup: kbMain()
+      });
+      return;
+    }
+
+    if (data === "video") {
+      await bot.answerCallbackQuery(q.id);
+
+      const v = await getLatestVideoUrl();
+      if (!v?.youtube_url) {
+        await bot.sendMessage(chatId, "📺 No video added yet. Admin please add a YouTube link.");
+        return;
+      }
+
+      const title = v.title ? `🎬 <b>${escapeHtml(v.title)}</b>\n` : "";
+      await bot.sendMessage(
+        chatId,
+        `${title}📌 Today Video:\n${v.youtube_url}`,
+        { parse_mode: "HTML", reply_markup: kbMain() }
+      );
+      return;
+    }
+
+    if (data === "stats") {
+      await bot.answerCallbackQuery(q.id);
+      const { data: u, error } = await supabase
         .from("users")
-        .select("coins,name")
-        .eq("user_id", userId)
+        .select("coins,taps,streak")
+        .eq("tg_id", tg_id)
         .single();
 
       if (error) throw error;
 
-      const newCoins = (row?.coins || 0) + 1;
-
-      // Update coins
-      const { error: upErr } = await supabase
-        .from("users")
-        .update({ coins: newCoins })
-        .eq("user_id", userId);
-
-      if (upErr) throw upErr;
-
-      // Edit same message (safe)
-      await bot.editMessageText(panel(row?.name || name, newCoins), {
-        chat_id: chatId,
-        message_id: messageId,
-        ...MENU(newCoins),
-      });
-
-      return;
-    }
-
-    if (q.data === "wallet") {
-      const { data: row } = await supabase
-        .from("users")
-        .select("coins,name")
-        .eq("user_id", userId)
-        .single();
-
-      const coins = row?.coins || 0;
-      await bot.editMessageText(
-        `💰 <b>Wallet</b>\n━━━━━━━━━━━━━━\n🪙 Coins: <b>${coins}</b>\n\n<i>Withdraw rules:\n• Min withdrawal: $100\n• First withdrawal: after 30 days\n• Then weekly</i>`,
-        { chat_id: chatId, message_id: messageId, parse_mode: "HTML", reply_markup: MENU(coins).reply_markup }
+      await bot.sendMessage(
+        chatId,
+        `📊 <b>Your Stats</b>\n🪙 Coins: ${Number(u.coins || 0)}\n👆 Taps: ${Number(u.taps || 0)}\n🔥 Streak: ${Number(u.streak || 0)}`,
+        { parse_mode: "HTML", reply_markup: kbMain() }
       );
       return;
     }
 
-    if (q.data === "task") {
-      await bot.editMessageText(
-        `📋 <b>Daily Task</b>\n━━━━━━━━━━━━━━\n✅ Tap daily up to limit\n✅ Then unlock video task\n\n<i>Daily reset: every 24 hours</i>`,
-        { chat_id: chatId, message_id: messageId, parse_mode: "HTML", reply_markup: MENU(0).reply_markup }
+    if (data === "withdraw") {
+      await bot.answerCallbackQuery(q.id);
+      await bot.sendMessage(
+        chatId,
+        "💳 Withdraw feature coming soon.\n(Next step: TRC20 address + request table)",
+        { reply_markup: kbMain() }
       );
       return;
     }
 
-    if (q.data === "video") {
-      await bot.editMessageText(
-        `🎥 <b>Video Task</b>\n━━━━━━━━━━━━━━\n<i>Coming next:</i>\n• Show today’s YouTube link\n• After watch → bonus coins button`,
-        { chat_id: chatId, message_id: messageId, parse_mode: "HTML", reply_markup: MENU(0).reply_markup }
+    await bot.answerCallbackQuery(q.id);
+  } catch (err) {
+    console.error("CALLBACK ERROR:", err?.message || err);
+    if (chatId) {
+      await bot.sendMessage(
+        chatId,
+        "⚠️ Server issue. Please try /start again in 10 seconds."
       );
-      return;
     }
-
-    if (q.data === "withdraw") {
-      await bot.editMessageText(
-        `🧾 <b>Withdraw</b>\n━━━━━━━━━━━━━━\n⚠️ Min withdraw: <b>$100</b>\n⏳ First withdraw: <b>30 days</b>\n📅 Then: weekly\n\n<i>Next: TRC20 address add + request submit</i>`,
-        { chat_id: chatId, message_id: messageId, parse_mode: "HTML", reply_markup: MENU(0).reply_markup }
-      );
-      return;
-    }
-
-    if (q.data === "leaderboard") {
-      await bot.editMessageText(
-        `🏆 <b>Leaderboard</b>\n━━━━━━━━━━━━━━\n<i>Next step: top users by coins</i>`,
-        { chat_id: chatId, message_id: messageId, parse_mode: "HTML", reply_markup: MENU(0).reply_markup }
-      );
-      return;
-    }
-  } catch (e) {
-    console.error("callback error:", e);
-    // Don’t crash; just ignore
+    try {
+      await bot.answerCallbackQuery(q.id);
+    } catch (_) {}
   }
 });
 
-app.get("/", (req, res) => res.send("aiTapTap backend running ✅"));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log("Server running on port", PORT));
+// Keep-alive log
+console.log("✅ Bot is running with polling...");
