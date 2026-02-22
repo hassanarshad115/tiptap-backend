@@ -227,5 +227,3 @@ bot.on("callback_query", async (q) => {
 
 // Keep-alive log
 console.log("✅ Bot is running with polling...");
-// 4. 👇 LAST LINE (IMPORTANT)
-bot.startPolling();
