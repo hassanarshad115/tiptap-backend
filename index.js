@@ -1,5 +1,5 @@
 // Simple Telegram Tap-to-Earn bot using Supabase
-// Required env vars on Railway:
+// Env vars (Railway):
 // BOT_TOKEN, SUPABASE_URL, SUPABASE_KEY
 
 const TelegramBot = require("node-telegram-bot-api");
@@ -13,8 +13,22 @@ if (!BOT_TOKEN) throw new Error("Missing env: BOT_TOKEN");
 if (!SUPABASE_URL) throw new Error("Missing env: SUPABASE_URL");
 if (!SUPABASE_KEY) throw new Error("Missing env: SUPABASE_KEY");
 
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// ✅ ONLY ONE polling start (no bot.startPolling())
+const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+
+// ✅ Handle polling errors (especially 409 conflict)
+bot.on("polling_error", (err) => {
+  const msg = String(err?.message || err);
+  console.error("POLLING ERROR:", msg);
+
+  // Telegram 409 conflict => another instance is running
+  if (msg.includes("409") || msg.toLowerCase().includes("conflict")) {
+    console.error("409 Conflict detected. Exiting to let Railway restart cleanly.");
+    process.exit(1);
+  }
+});
 
 function kbMain() {
   return {
@@ -22,10 +36,10 @@ function kbMain() {
       [{ text: "🔥 TAP", callback_data: "tap" }],
       [
         { text: "📺 Today Video", callback_data: "video" },
-        { text: "📊 Stats", callback_data: "stats" }
+        { text: "📊 Stats", callback_data: "stats" },
       ],
-      [{ text: "💳 Withdraw", callback_data: "withdraw" }]
-    ]
+      [{ text: "💳 Withdraw", callback_data: "withdraw" }],
+    ],
   };
 }
 
@@ -51,7 +65,7 @@ async function ensureUser(tgUser) {
       {
         tg_id,
         name,
-        last_active_date: new Date().toISOString().slice(0, 10)
+        last_active_date: new Date().toISOString().slice(0, 10),
       },
       { onConflict: "tg_id" }
     )
@@ -75,31 +89,11 @@ async function getLatestVideoUrl() {
   return data;
 }
 
-async function incrementTap(tg_id) {
-  const { data: u, error: e1 } = await supabase
-    .from("users")
-    .select("coins,taps")
-    .eq("tg_id", tg_id)
-    .single();
-
-  if (e1) throw e1;
-
-  const newCoins = Number(u.coins || 0) + 1;
-  const newTaps = Number(u.taps || 0) + 1;
-
-  const { data: updated, error: e2 } = await supabase
-    .from("users")
-    .update({
-      coins: newCoins,
-      taps: newTaps,
-      last_active_date: new Date().toISOString().slice(0, 10)
-    })
-    .eq("tg_id", tg_id)
-    .select("coins,taps")
-    .single();
-
-  if (e2) throw e2;
-  return updated;
+// ✅ ATOMIC increment via RPC (best)
+async function incrementTapAtomic(tg_id) {
+  const { data, error } = await supabase.rpc("tap_increment", { p_tg_id: tg_id });
+  if (error) throw error; // data returns updated row (coins,taps)
+  return data;
 }
 
 async function replyHome(chatId, userRow) {
@@ -113,7 +107,7 @@ async function replyHome(chatId, userRow) {
 
   await bot.sendMessage(chatId, text, {
     parse_mode: "HTML",
-    reply_markup: kbMain()
+    reply_markup: kbMain(),
   });
 }
 
@@ -126,10 +120,7 @@ bot.onText(/\/start/, async (msg) => {
     await replyHome(chatId, u);
   } catch (err) {
     console.error("START ERROR:", err?.message || err);
-    await bot.sendMessage(
-      chatId,
-      "⚠️ Server issue. Please try /start again in 10 seconds."
-    );
+    await bot.sendMessage(chatId, "⚠️ Server issue. Please try /start again in 10 seconds.");
   }
 });
 
@@ -145,7 +136,7 @@ bot.on("callback_query", async (q) => {
     if (data === "tap") {
       await bot.answerCallbackQuery(q.id, { text: "✅ +1 coin" });
 
-      const updated = await incrementTap(tg_id);
+      const updated = await incrementTapAtomic(tg_id);
 
       const text =
         `🪙 Coins: <b>${Number(updated.coins || 0)}</b>\n` +
@@ -153,7 +144,7 @@ bot.on("callback_query", async (q) => {
 
       await bot.sendMessage(chatId, text, {
         parse_mode: "HTML",
-        reply_markup: kbMain()
+        reply_markup: kbMain(),
       });
       return;
     }
@@ -168,11 +159,10 @@ bot.on("callback_query", async (q) => {
       }
 
       const title = v.title ? `🎬 <b>${escapeHtml(v.title)}</b>\n` : "";
-      await bot.sendMessage(
-        chatId,
-        `${title}📌 Today Video:\n${v.youtube_url}`,
-        { parse_mode: "HTML", reply_markup: kbMain() }
-      );
+      await bot.sendMessage(chatId, `${title}📌 Today Video:\n${v.youtube_url}`, {
+        parse_mode: "HTML",
+        reply_markup: kbMain(),
+      });
       return;
     }
 
@@ -209,12 +199,11 @@ bot.on("callback_query", async (q) => {
   } catch (err) {
     console.error("CALLBACK ERROR:", err?.message || err);
     if (chatId) {
-      await bot.sendMessage(
-        chatId,
-        "⚠️ Server issue. Please try /start again in 10 seconds."
-      );
+      await bot.sendMessage(chatId, "⚠️ Server issue. Please try /start again in 10 seconds.");
     }
-    try { await bot.answerCallbackQuery(q.id); } catch (_) {}
+    try {
+      await bot.answerCallbackQuery(q.id);
+    } catch (_) {}
   }
 });
 
