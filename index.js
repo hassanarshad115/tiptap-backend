@@ -34,12 +34,17 @@ function safeName(user) {
   return String(n).slice(0, 40);
 }
 
+function escapeHtml(s) {
+  return String(s)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
 async function ensureUser(tgUser) {
   const tg_id = Number(tgUser.id);
   const name = safeName(tgUser);
 
-  // upsert user by tg_id
-  // NOTE: requires users table with columns: tg_id (unique), name, coins, taps, streak, last_active_date
   const { data, error } = await supabase
     .from("users")
     .upsert(
@@ -58,7 +63,6 @@ async function ensureUser(tgUser) {
 }
 
 async function getLatestVideoUrl() {
-  // videos table: youtube_url, is_active, created_at
   const { data, error } = await supabase
     .from("videos")
     .select("youtube_url,title,created_at")
@@ -68,11 +72,10 @@ async function getLatestVideoUrl() {
     .maybeSingle();
 
   if (error) throw error;
-  return data; // can be null if no rows
+  return data;
 }
 
 async function incrementTap(tg_id) {
-  // 1) fetch current
   const { data: u, error: e1 } = await supabase
     .from("users")
     .select("coins,taps")
@@ -84,7 +87,6 @@ async function incrementTap(tg_id) {
   const newCoins = Number(u.coins || 0) + 1;
   const newTaps = Number(u.taps || 0) + 1;
 
-  // 2) update
   const { data: updated, error: e2 } = await supabase
     .from("users")
     .update({
@@ -115,13 +117,6 @@ async function replyHome(chatId, userRow) {
   });
 }
 
-function escapeHtml(s) {
-  return String(s)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
-}
-
 // /start
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
@@ -148,7 +143,6 @@ bot.on("callback_query", async (q) => {
     if (!chatId) return;
 
     if (data === "tap") {
-      // quick ack so Telegram spinner stops
       await bot.answerCallbackQuery(q.id, { text: "✅ +1 coin" });
 
       const updated = await incrementTap(tg_id);
@@ -184,6 +178,7 @@ bot.on("callback_query", async (q) => {
 
     if (data === "stats") {
       await bot.answerCallbackQuery(q.id);
+
       const { data: u, error } = await supabase
         .from("users")
         .select("coins,taps,streak")
@@ -219,11 +214,8 @@ bot.on("callback_query", async (q) => {
         "⚠️ Server issue. Please try /start again in 10 seconds."
       );
     }
-    try {
-      await bot.answerCallbackQuery(q.id);
-    } catch (_) {}
+    try { await bot.answerCallbackQuery(q.id); } catch (_) {}
   }
 });
 
-// Keep-alive log
 console.log("✅ Bot is running with polling...");
